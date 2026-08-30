@@ -1,0 +1,8 @@
+{
+  "name": "Telegram News Digest + Voice",
+  "description": "AI-powered news summarization and voice readout for Telegram channels with interactive player and complete Python bot generator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
