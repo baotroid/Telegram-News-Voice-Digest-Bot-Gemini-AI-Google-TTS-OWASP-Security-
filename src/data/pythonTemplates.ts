@@ -316,6 +316,7 @@ from aiogram.types import (
     LinkPreviewOptions
 )
 from aiogram.enums import ParseMode
+from aiohttp import web
 from aiogram.client.session.aiohttp import AiohttpSession
 
 from config import settings
@@ -334,6 +335,31 @@ from services.tts_service import tts_service, AVAILABLE_VOICES
 
 # Initialize Secure Masking & File Logger (saves to logs/bot.log)
 logger = setup_secure_logging(log_file="logs/bot.log")
+
+async def start_healthcheck_server():
+    """
+    Embedded lightweight HTTP server for Cloud Hosting (Render, Railway, Fly.io, Cloud Run).
+    Prevents Render from timing out with 'No open ports detected' when deployed as a Web Service.
+    """
+    port_env = os.getenv("PORT")
+    if not port_env:
+        return None
+    try:
+        port = int(port_env)
+        app = web.Application()
+        async def health(request):
+            return web.Response(text="OK - AI Telegram Bot is Running and Polling", content_type="text/plain")
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"Health-check HTTP server successfully listening on 0.0.0.0:{port}")
+        return runner
+    except Exception as e:
+        logger.warning(f"Could not bind health-check server to port {port_env}: {e}")
+        return None
 
 # Resilient Aiohttp session with timeout for Windows network stability
 session = AiohttpSession(timeout=60.0)
@@ -1366,10 +1392,24 @@ async def main():
     logger.info("Starting Telegram reader service...")
     await reader_service.start()
     
+    # Start Cloud Health-check HTTP server if $PORT is assigned (Render Web Service / Railway / Cloud Run)
+    health_runner = await start_healthcheck_server()
+
+    logger.info("Resetting existing webhooks and dropping pending updates to prevent polling conflicts...")
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:
+        logger.warning(f"Note on delete_webhook: {e}")
+
     logger.info("Starting Aiogram bot polling with OWASP Security Middlewares active...")
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
+        if health_runner:
+            try:
+                await health_runner.cleanup()
+            except Exception:
+                pass
         await reader_service.stop()
         await bot.session.close()
 
@@ -2186,31 +2226,34 @@ class GeminiDigestService:
                         f"Сгенерируй качественный и подробный итоговый дайджест со всеми ключевыми новостями и кликабельными HTML-ссылками, полностью очищенный от рекламы букмекеров, спама, кликбейта, партнерских постов и подписей про MAX."
                     )
 
-                logger.info("Requesting digest from Google Gemini API (gemini-3.7-flash)...")
-                response = self.client.models.generate_content(
-                    model="gemini-3.7-flash",
-                    contents=user_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.6
-                    )
-                )
+                candidate_models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+                for model_name in candidate_models:
+                    try:
+                        logger.info(f"Requesting digest from Google Gemini API ({model_name})...")
+                        response = self.client.models.generate_content(
+                            model=model_name,
+                            contents=user_prompt,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_instruction,
+                                temperature=0.6
+                            )
+                        )
 
-                full_text = response.text
-                if full_text and len(full_text.strip()) > 30:
-                    clean_speech = self._clean_for_speech(full_text)
-                    logger.info("Successfully generated digest via Gemini AI.")
-                    return full_text, clean_speech
+                        full_text = response.text
+                        if full_text and len(full_text.strip()) > 30:
+                            clean_speech = self._clean_for_speech(full_text)
+                            logger.info(f"Successfully generated digest via Gemini AI ({model_name}).")
+                            return full_text, clean_speech
+                    except Exception as model_err:
+                        err_str = str(model_err)
+                        if "location is not supported" in err_str or "FAILED_PRECONDITION" in err_str:
+                            logger.warning("Gemini API location is not supported in current network.")
+                            break
+                        logger.warning(f"Gemini model {model_name} returned: {model_err}. Trying next fallback...")
+                        continue
 
             except Exception as e:
-                err_str = str(e)
-                if "location is not supported" in err_str or "FAILED_PRECONDITION" in err_str:
-                    logger.warning(
-                        "Gemini API location is not supported in current network. "
-                        "Activating intelligent Extractive Fallback Digest with direct post links..."
-                    )
-                else:
-                    logger.warning(f"Gemini API call returned: {e}. Using resilient fallback digest...")
+                logger.warning(f"Gemini API call returned: {e}. Using resilient fallback digest...")
 
         # Resilient Automatic Fallback: Smart Extractive Digest
         return self._generate_fallback_digest(posts, user_name, lang=lang, period_label=period_label)

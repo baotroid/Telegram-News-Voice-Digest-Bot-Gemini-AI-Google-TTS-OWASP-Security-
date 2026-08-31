@@ -76,19 +76,32 @@ export const ArchitectureGuide: React.FC = () => {
     },
     {
       step: 5,
-      title: 'Развертывание 24/7 (VPS, Docker или Android)',
-      badge: 'Хостинг',
-      desc: 'Бот может работать круглосуточно на недорогом VPS сервере (Ubuntu/Debian) или прямо в Docker контейнере.',
+      title: 'Развертывание 24/7 (Render, Railway, VPS или Docker)',
+      badge: 'Хостинг & Облако',
+      desc: 'Бот может работать круглосуточно на Render.com, Railway, VPS (Ubuntu/Debian) или прямо в Docker контейнере.',
       instructions: [
-        'Вариант 1 (Docker): `docker-compose up -d --build`',
-        'Вариант 2 (Systemd служба на VPS): запустите фоновый сервис systemctl',
-        'Вариант 3 (Смартфон Android): можно запускать через приложение Termux с установленным Python 3.11!',
+        'Вариант 1 (Render.com / Railway): Создайте Web Service или Background Worker. В проект уже встроен легковесный HTTP health-сервер на $PORT для успешного прохождения Port Scan на Render!',
+        'Вариант 2 (Docker Compose): `docker-compose up -d --build`',
+        'Вариант 3 (Systemd служба на VPS): настройте автозапуск через systemctl',
+        'Вариант 4 (Смартфон Android): можно запускать через Termux с Python 3.11!',
       ],
-      codeSnippet: `# Запуск в фоне через Docker Compose:\ndocker-compose up -d --build\n\n# Просмотр логов:\ndocker-compose logs -f`,
+      codeSnippet: `# Запуск в фоне через Docker Compose:\ndocker-compose up -d --build\n\n# Запуск на Render/Railway (Start Command):\npython bot.py`,
     },
   ];
 
   const faqs = [
+    {
+      q: 'Что делать при ошибке «TelegramConflictError: Conflict: terminated by other getUpdates request»?',
+      a: 'Telegram разрешает только одному процессу опрашивать бота по getUpdates. Эта ошибка означает, что бот запущен одновременно в двух местах (например: на локальном компьютере в терминале и на сервере Render/VPS, либо старый контейнер на Render еще не остановился). Остановите локальный запуск (`Ctrl+C`), и бот на сервере автоматически подключится без конфликта.',
+    },
+    {
+      q: 'Почему Render писал «No open ports detected» и перезагружал контейнер?',
+      a: 'Если на Render выбран тип «Web Service», платформа сканирует открытый порт ($PORT). Если бот не слушает HTTP-порт, Render считает сервис зависшим и присылает SIGTERM. В наш шаблон bot.py уже встроен легкий встроенный aiohttp HTTP health-check сервер, который автоматически открывает порт при наличии переменной $PORT, обеспечивая 100% стабильность на Render и Railway.',
+    },
+    {
+      q: 'Как передать авторизованную сессию Telethon (user_session.session) на Render / VPS?',
+      a: '1) Запустите бота один раз локально на компьютере (`python bot.py`) и пройдите ввод кода из Telegram. 2) Создастся файл `user_session.session`. 3) Загрузите этот файл на сервер (в git-репозиторий как секрет или в папку бота) — и бот на сервере запустится сразу без запроса кода из SMS!',
+    },
     {
       q: 'Можно ли читать закрытые (приватные) Telegram-каналы?',
       a: 'Да! Поскольку Telethon использует клиентский Telegram API (MTProto), он имеет доступ ко всем каналам и чатам, в которых состоит ваш личный Telegram-аккаунт, включая приватные каналы по инвайт-ссылкам.',

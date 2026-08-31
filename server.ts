@@ -143,19 +143,25 @@ app.post("/api/gemini/summarize", async (req, res) => {
     let summaryText = "";
 
     if (process.env.GEMINI_API_KEY) {
-      try {
-        const ai = getAi();
-        const response = await ai.models.generateContent({
-          model: "gemini-3.7-flash",
-          contents: userPrompt,
-          config: {
-            systemInstruction: systemPrompt,
-            temperature: 0.6,
-          },
-        });
-        summaryText = response.text || "";
-      } catch {
-        // Fall back to template synthesizer if quota/network error
+      const candidateModels = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"];
+      const ai = getAi();
+      for (const modelName of candidateModels) {
+        try {
+          const response = await ai.models.generateContent({
+            model: modelName,
+            contents: userPrompt,
+            config: {
+              systemInstruction: systemPrompt,
+              temperature: 0.6,
+            },
+          });
+          if (response.text && response.text.length > 20) {
+            summaryText = response.text;
+            break;
+          }
+        } catch {
+          // Try next candidate model
+        }
       }
     }
 
