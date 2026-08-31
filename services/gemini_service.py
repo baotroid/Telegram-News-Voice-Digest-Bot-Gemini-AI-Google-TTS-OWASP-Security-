@@ -222,21 +222,47 @@ class GeminiDigestService:
                         f"Сгенерируй качественный и подробный итоговый дайджест со всеми ключевыми новостями и кликабельными HTML-ссылками, полностью очищенный от рекламы букмекеров, спама, кликбейта, партнерских постов и подписей про MAX."
                     )
 
-                logger.info("Requesting digest from Google Gemini API (gemini-3.7-flash)...")
-                response = self.client.models.generate_content(
-                    model="gemini-3.7-flash",
-                    contents=user_prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=system_instruction,
-                        temperature=0.6
-                    )
-                )
+                # Resilient multi-model fallback chain to handle 503 UNAVAILABLE or high demand spikes
+                candidate_models = [
+                    "gemini-2.5-flash",
+                    "gemini-2.0-flash",
+                    "gemini-3.7-flash",
+                    "gemini-1.5-flash"
+                ]
 
-                full_text = response.text
-                if full_text and len(full_text.strip()) > 30:
-                    clean_speech = self._clean_for_speech(full_text)
-                    logger.info("Successfully generated digest via Gemini AI.")
-                    return full_text, clean_speech
+                last_error = None
+                for model_name in candidate_models:
+                    try:
+                        logger.info(f"Requesting digest from Google Gemini API ({model_name})...")
+                        response = self.client.models.generate_content(
+                            model=model_name,
+                            contents=user_prompt,
+                            config=types.GenerateContentConfig(
+                                system_instruction=system_instruction,
+                                temperature=0.6
+                            )
+                        )
+
+                        full_text = response.text
+                        if full_text and len(full_text.strip()) > 30:
+                            clean_speech = self._clean_for_speech(full_text)
+                            logger.info(f"Successfully generated digest via Gemini AI ({model_name}).")
+                            return full_text, clean_speech
+                    except Exception as model_err:
+                        last_error = model_err
+                        err_msg = str(model_err)
+                        if "503" in err_msg or "UNAVAILABLE" in err_msg or "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg:
+                            logger.warning(f"Model {model_name} busy/unavailable ({model_err}). Trying next fallback model...")
+                            continue
+                        elif "location is not supported" in err_msg or "FAILED_PRECONDITION" in err_msg:
+                            logger.warning("Gemini API location not supported in current network.")
+                            break
+                        else:
+                            logger.warning(f"Model {model_name} error: {model_err}. Trying next fallback model...")
+                            continue
+
+                if last_error:
+                    logger.warning(f"All Gemini models exhausted. Last error: {last_error}. Using resilient fallback digest...")
 
             except Exception as e:
                 err_str = str(e)

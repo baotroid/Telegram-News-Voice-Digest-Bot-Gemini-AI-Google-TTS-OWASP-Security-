@@ -29,6 +29,7 @@ from aiogram.types import (
 )
 from aiogram.enums import ParseMode
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import web
 
 from config import settings
 from security import (
@@ -1071,7 +1072,39 @@ async def show_historical_digest(chat_id: int, user_id: int, index: int):
             reply_markup=get_digest_nav_keyboard(index, total_count)
         )
 
+async def start_healthcheck_server(port: int = 10000):
+    """
+    Lightweight HTTP health-check server for cloud platforms (Render, Railway, Fly.io, Cloud Run).
+    Render Web Services require listening on $PORT to pass health checks and prevent SIGTERM timeouts.
+    """
+    async def handle_health(request):
+        return web.Response(
+            text="Telegram News Voice Digest Bot is LIVE and Healthy! 🎙️",
+            content_type="text/plain",
+            status=200
+        )
+
+    app = web.Application()
+    app.router.add_get("/", handle_health)
+    app.router.add_get("/health", handle_health)
+    app.router.add_get("/healthz", handle_health)
+    
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Render/Cloud HTTP Health Check server successfully started on port {port} (0.0.0.0:{port})")
+    return runner
+
 async def main():
+    # Detect port from Render/Cloud environment (default: 10000 on Render)
+    port = int(os.environ.get("PORT", 10000))
+    runner = None
+    try:
+        runner = await start_healthcheck_server(port=port)
+    except Exception as e:
+        logger.warning(f"Could not start HTTP healthcheck server on port {port}: {e}")
+
     logger.info("Initializing encrypted storage...")
     await storage_service.init_db()
     
@@ -1080,10 +1113,13 @@ async def main():
     
     logger.info("Starting Aiogram bot polling with OWASP Security Middlewares active...")
     try:
-        await dp.start_polling(bot)
+        await bot.delete_webhook(drop_pending_updates=True)
+        await dp.start_polling(bot, drop_pending_updates=True)
     finally:
         await reader_service.stop()
         await bot.session.close()
+        if runner:
+            await runner.cleanup()
 
 if __name__ == "__main__":
     asyncio.run(main())
