@@ -28,7 +28,7 @@ TELEGRAM_API_ID=12345678
 TELEGRAM_API_HASH="abcdef..."
 GEMINI_API_KEY="AIzaSy..."
 ENCRYPTION_KEY="ваш_32_байтный_ключ"
-ADMIN_IDS=[123456789]
+ADMIN_IDS=[1111111111]
 ```
 
 ### 3. Запустите бота:
