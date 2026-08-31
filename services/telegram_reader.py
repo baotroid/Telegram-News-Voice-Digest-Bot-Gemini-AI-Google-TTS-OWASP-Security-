@@ -1,5 +1,6 @@
 import logging
 import re
+import html
 import aiohttp
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any
@@ -10,14 +11,35 @@ logger = logging.getLogger(__name__)
 def is_promotional_or_ad(text: str) -> bool:
     """
     Detects if a post is an advertisement, clickbait spam ('вас упомянул администратор'),
-    betting/gambling promo, partner post, casino/slots, or crypto scheme.
+    betting/gambling promo, card transfer solicitation ('сбрасывайте на карту'),
+    limited seats FOMO ('осталось одно место'), casino/slots, or crypto scam.
     """
     if not text or len(text.strip()) < 10:
         return False
     
     t_lower = text.lower()
     
-    # 1. Clickbait mentions / fake admin notifications / channel lock spam
+    # 1. Card numbers, transfers, payment spam & financial solicitations
+    card_and_payment_patterns受到 = [
+        "сбрасывайте на карту", "сбросьте на карту", "перевод на карту", "переводите на карту",
+        "номер карты", "реквизиты карты", "сбербанк", "на сбер", "на тинькофф", "на т-банк",
+        "оплата на карту", "донат на карту", "сбор средств", "по номеру карты", "кидайте на карту"
+    ]
+    if any(p in t_lower for p in card_and_payment_patterns受到):
+        return True
+
+    # 2. Scarcity & FOMO sales tricks / seat limits
+    fomo_patterns = [
+        "осталось одно место", "осталось 1 место", "осталось 2 места", "осталось 3 места",
+        "осталось всего", "последнее место", "мест ограничено", "количество мест ограничено",
+        "занять место", "забронировать место", "бронь места", "успей занять", "вход закрывается",
+        "вход платный", "доступ платный", "вход строго по", "платная подписка", "складчина",
+        "бронируй место", "забирай доступ"
+    ]
+    if any(p in t_lower for p in fomo_patterns):
+        return True
+
+    # 3. Clickbait mentions / fake admin notifications / channel lock spam
     spam_patterns = [
         "вас упомянул", "вас упомянули", "упомянул администратор", "упомянула администратор",
         "упомянул вас", "вам пришло уведомление", "вход только по ссылке",
@@ -25,12 +47,14 @@ def is_promotional_or_ad(text: str) -> bool:
         "заявка на вступление", "канал удалят через", "успей подписаться",
         "закрытый канал", "ссылка в закрепе", "переходи в закреп",
         "переходите по ссылке", "ссылка действует", "ссылка активна",
-        "только по этой ссылке", "по ссылке выше", "ссылка ниже"
+        "только по этой ссылке", "по ссылке выше", "ссылка ниже",
+        "пиши в лс", "пиши мне в лс", "пишите менеджеру", "личные сообщения",
+        "по ссылке в описании", "канал спонсора", "спонсор канала"
     ]
     if any(p in t_lower for p in spam_patterns):
         return True
         
-    # 2. Ads, Partner posts, Sponsorship disclaimers
+    # 4. Ads, Partner posts, Sponsorship disclaimers
     ad_disclaimers = [
         "#реклама", "erid:", "erid=", "токен рекламы", "реклама.", "реклама:",
         "партнерский материал", "партнёрский материал", "партнерский пост",
@@ -43,24 +67,29 @@ def is_promotional_or_ad(text: str) -> bool:
     if any(p in t_lower for p in ad_disclaimers):
         return True
         
-    # 3. Bookmakers, Sports betting, Gambling & Casinos
+    # 5. Bookmakers, Sports betting, Gambling & Casinos
     gambling_markers = [
-        "букмекер", "букмекерск", "ставки на спорт", "ставка на спорт",
+        "букмекер", "букмекерск", "букмекерская контора", "ставки на спорт", "ставка на спорт",
         "поставить ставку", "бк ", "1xbet", "fonbet", "фонбет", "winline",
         "винлайн", "melbet", "мелбет", "париматч", "parimatch", "лига ставок",
-        "betboom", "бетбум", "1win", "олимпбет", "olimpbet", "фрибет",
+        "betboom", "бетбум", "1win", "олимпбет", "olimpbet", "фрибет", "freebet",
         "бонус к депозиту", "бонус за регистрацию", "депозит от", "коэффициент на матч",
-        "прогноз на матч", "экспресс на сегодня", "железобетонный экспресс",
+        "кэф ", "кэфы", "прогноз на матч", "экспресс на сегодня", "железобетонный экспресс",
+        "бетон на сегодня", "договорной матч", "инсайд на матч", "проходимость 100%",
         "казино", "слоты", "casino", "джекпот", "выигрыш в слотах", "онлайн-казино",
-        "рулетка", "игровые автоматы", "демо-счет"
+        "рулетка", "игровые автоматы", "демо-счет", "занос в слотах", "крутить слоты",
+        "вулкан", "joycasino", "джойказино", "забрать бонус", "забирай бонус", "получи бонус"
     ]
     if any(p in t_lower for p in gambling_markers):
         return True
         
-    # 4. Crypto schemes, pump and dump, get-rich-quick scams
+    # 6. Crypto schemes, pump and dump, get-rich-quick scams
     scam_markers = [
         "криптосигналы", "сигналы на крипту", "памп монеты", "схема заработка",
-        "доходность от %", "раскрутка депозита", "пассивный доход от", "инвестируй и получай"
+        "доходность от %", "раскрутка депозита", "пассивный доход", "инвестируй и получай",
+        "арбитраж крипты", "связка p2p", "p2p связка", "аирдроп", "airdrop",
+        "тапалка", "hamster kombat", "notcoin", "легкие деньги", "заработок без вложений",
+        "работа на дому от"
     ]
     if any(p in t_lower for p in scam_markers):
         return True
@@ -70,10 +99,17 @@ def is_promotional_or_ad(text: str) -> bool:
 def clean_boilerplate_and_signatures(text: str) -> str:
     """
     Cleans out channel boilerplate footers, mirror channel notices (e.g. 'Дублируем все посты в MAX...'),
-    cross-promotions, social media mirror warnings, and generic marketing noise from Telegram posts.
+    cross-promotions, HTML entities (&nbsp;, &quot;, &nbs), social media mirror warnings, and generic marketing noise.
     """
     if not text:
         return ""
+    
+    # Unescape HTML entities first
+    text = html.unescape(text)
+    # Strip any lingering HTML entity artifacts like &nbsp;, &nbs, &quot;, &#160;, etc.
+    text = re.sub(r'&(?:nbsp|quot|amp|lt|gt|apos|[a-zA-Z]+|\#\d+|\#x[0-9a-fA-F]+);?', ' ', text)
+    text = re.sub(r'&nbs\b', ' ', text)
+    text = re.sub(r'&[a-zA-Z0-9#]+;?', ' ', text)
     
     boilerplate_patterns = [
         r'(?i)дублируем\s+(?:все\s+)?посты\s+в\s+max[^\n\.\!]*',
@@ -107,7 +143,8 @@ def clean_boilerplate_and_signatures(text: str) -> str:
         if any(term in l_lower for term in [
             "дублируем", "не грузит telegram", "не грузит телеграм", "зеркало в max",
             "канал в max", "посты в max", "erid:", "#реклама", "партнерский материал",
-            "подпишись на", "подписывайтесь на", "по вопросам рекламы", "вас упомянул"
+            "подпишись на", "подписывайтесь на", "по вопросам рекламы", "вас упомянул",
+            "сбрасывайте на карту", "осталось одно место", "осталось 1 место"
         ]):
             continue
         filtered_lines.append(line)
@@ -240,8 +277,13 @@ class TelegramReaderService:
             )
             
             for post_id_str, raw_text in message_matches[-max_posts:]:
-                clean_text = re.sub(r'<brs*/?>', '\n', raw_text)
-                clean_text = re.sub(r'<[^>]+>', '', clean_text).strip()
+                clean_text = re.sub(r'<br\s*/?>', '\n', raw_text)
+                clean_text = re.sub(r'<[^>]+>', '', clean_text)
+                clean_text = html.unescape(clean_text)
+                clean_text = re.sub(r'&(?:nbsp|quot|amp|lt|gt|apos|[a-zA-Z]+|\#\d+|\#x[0-9a-fA-F]+);?', ' ', clean_text)
+                clean_text = re.sub(r'&nbs\b', ' ', clean_text)
+                clean_text = re.sub(r'&[a-zA-Z0-9#]+;?', ' ', clean_text)
+                clean_text = clean_text.strip()
                 
                 # Strict Ad & Promo filter
                 if is_promotional_or_ad(clean_text):

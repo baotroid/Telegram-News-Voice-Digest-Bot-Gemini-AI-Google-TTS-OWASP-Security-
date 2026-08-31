@@ -758,23 +758,27 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
             lang = await storage_service.get_user_lang(user_id)
             current_voice, _ = await storage_service.get_user_voice(user_id)
             text = "🗣️ <b>Select voice for audio broadcast:</b>" if lang == "en" else "🗣️ <b>Выберите голос диктора для озвучивания:</b>"
-            try:
-                await callback.message.edit_text(text, reply_markup=get_voice_keyboard(current_voice, lang))
-            except Exception:
-                await callback.message.answer(text, reply_markup=get_voice_keyboard(current_voice, lang))
+            if callback.message and callback.message.text:
+                try:
+                    await callback.message.edit_text(text, reply_markup=get_voice_keyboard(current_voice, lang))
+                except Exception:
+                    await bot.send_message(chat_id, text, reply_markup=get_voice_keyboard(current_voice, lang))
+            else:
+                await bot.send_message(chat_id, text, reply_markup=get_voice_keyboard(current_voice, lang))
 
         elif data.startswith("set_voice:"):
             lang = await storage_service.get_user_lang(user_id)
             new_voice = data.split(":", 1)[1]
             engine = "gtts" if new_voice.startswith("gtts") else "edge-tts"
-            await storage_service.set_user_voice(user_id, new_voice, engine)
+            await storage_service.set_user_voice(user_id=user_id, voice_id=new_voice, engine=engine)
             v_info = AVAILABLE_VOICES.get(new_voice, {"name": new_voice})
             toast = f"Voice updated to: {v_info.get('name')}" if lang == "en" else f"Голос изменен на: {v_info.get('name')}"
             await callback.answer(toast, show_alert=True)
-            try:
-                await callback.message.edit_reply_markup(reply_markup=get_voice_keyboard(new_voice, lang))
-            except Exception:
-                pass
+            if callback.message and callback.message.reply_markup:
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=get_voice_keyboard(new_voice, lang))
+                except Exception:
+                    pass
 
         elif data.startswith("sample_voice:"):
             sample_voice_id = data.split(":", 1)[1]
@@ -811,10 +815,13 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
                     f"Слушатель: <b>{user_name}</b>\n"
                     f"Выберите действие ниже или введите команду <code>/news</code>:"
                 )
-            try:
-                await callback.message.edit_text(text, reply_markup=get_main_keyboard(lang))
-            except Exception:
-                await callback.message.answer(text, reply_markup=get_main_keyboard(lang))
+            if callback.message and callback.message.text:
+                try:
+                    await callback.message.edit_text(text, reply_markup=get_main_keyboard(lang))
+                except Exception:
+                    await bot.send_message(chat_id, text, reply_markup=get_main_keyboard(lang))
+            else:
+                await bot.send_message(chat_id, text, reply_markup=get_main_keyboard(lang))
 
         elif data == "cancel_fsm":
             await state.clear()
@@ -825,7 +832,10 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
                 pass
     except Exception as e:
         logger.error(f"Callback query exception ({data}): {e}", exc_info=True)
-        await callback.answer("⚠️ Произошла ошибка при обработке клика.", show_alert=True)
+        try:
+            await callback.answer("⚠️ Произошла ошибка при обработке клика.", show_alert=True)
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # Core Digest Pipeline with Secure Exception Handling
@@ -841,7 +851,7 @@ async def process_digest_request(
     prep_text = (
         f"⏳ <b>Preparation:</b> Reading your tracked channels for {hours_limit}h..."
         if lang == "en" else
-        f"⏳ <b>Подготовка:</b> Получаем список ваших каналов за {'24 часа' if hours_limit == 24 else '48 часов (сегодня + вчера)'}..."
+        f"⏳ <b>Подготовка:</b> Получаем публикации из ваших каналов за {'24 часа' if hours_limit == 24 else '48 часов (сегодня + вчера)'}..."
     )
     status_msg = await bot.send_message(chat_id, prep_text)
     
@@ -883,7 +893,7 @@ async def process_digest_request(
         posts = await reader_service.fetch_latest_posts(
             channels=channels,
             hours_limit=hours_limit,
-            max_posts_per_channel=30
+            max_posts_per_channel=40
         )
 
         if not posts:
@@ -895,6 +905,33 @@ async def process_digest_request(
                 "Попробуйте позже или добавьте больше каналов через <code>/add @channel</code>."
             )
             await status_msg.edit_text(no_posts_text, reply_markup=get_main_keyboard(lang))
+            return
+
+        # Pre-filter all incoming posts from advertising, scams and boilerplate
+        from services.gemini_service import is_promotional_or_ad, clean_boilerplate_and_signatures
+        clean_posts = []
+        for p in posts:
+            raw_text = p.get('text', '')
+            if not raw_text or len(raw_text.strip()) < 15 or is_promotional_or_ad(raw_text):
+                continue
+            cleaned = clean_boilerplate_and_signatures(raw_text)
+            if len(cleaned) < 15 or is_promotional_or_ad(cleaned):
+                continue
+            p_copy = dict(p)
+            p_copy['text'] = cleaned
+            clean_posts.append(p_copy)
+
+        posts = clean_posts
+
+        if not posts:
+            no_subst_text = (
+                f"📭 <b>No substantive news found for the last {hours_limit} hours</b> (all posts were filtered as promotional or boilerplate).\n"
+                "Please try again later or add more active news channels."
+                if lang == "en" else
+                f"📭 <b>Не найдено содержательных новостей за последние {hours_limit}ч</b> (все публикации были отфильтрованы как реклама или служебные).\n"
+                "Попробуйте позже или добавьте новые новостные каналы."
+            )
+            await status_msg.edit_text(no_subst_text, reply_markup=get_main_keyboard(lang))
             return
 
         # Deduplication: Exclude posts that were already included in earlier digests today
@@ -922,90 +959,141 @@ async def process_digest_request(
 
         posts = unseen_posts
 
-        # Step 2: Analyze with Gemini
-        step2_text = (
-            f"🧠 <b>Step 2/3:</b> Gemini AI is analyzing {len(posts)} new posts from all channels..."
-            if lang == "en" else
-            f"🧠 <b>Шаг 2/3:</b> Gemini анализирует {len(posts)} новых постов и формирует сценарий..."
-        )
-        await status_msg.edit_text(step2_text)
-        
+        # Dynamic Batching: Split into issues if total news > 24
+        MAX_POSTS_PER_PART = 24
+        chunks = [posts[i:i + MAX_POSTS_PER_PART] for i in range(0, len(posts), MAX_POSTS_PER_PART)]
+        total_parts = len(chunks)
+        total_posts_count = len(posts)
+
         period_label = "последние 48 часов (сегодня и вчера)" if hours_limit == 48 else "сегодняшний день (24 часа)"
-        digest_text, clean_speech_text = await gemini_service.generate_digest(
-            posts=posts,
-            style="podcast",
-            user_name=user_name,
-            lang=lang,
-            period_label=period_label
-        )
+        period_label_en = "the last 48 hours (today & yesterday)" if hours_limit == 48 else "today (24 hours)"
+        active_period_label = period_label_en if lang == "en" else period_label
 
-        # Save to user session history
-        history_idx = await storage_service.save_user_digest(
-            user_id=user_id,
-            summary=digest_text,
-            clean_speech=clean_speech_text,
-            voice_id=voice_id,
-            voice_name=voice_display_name,
-            channels=channels
-        )
-        total_history = len(await storage_service.get_user_history(user_id))
+        for part_idx, chunk in enumerate(chunks, 1):
+            start_num = (part_idx - 1) * MAX_POSTS_PER_PART + 1
+            end_num = start_num + len(chunk) - 1
 
-        # Mark all included posts as seen for today
-        new_seen_keys = [p.get("url") or f"{p.get('channel')}_{p.get('id')}" for p in posts]
-        await storage_service.mark_posts_seen_today(user_id, new_seen_keys)
+            part_info = {
+                "part": part_idx,
+                "total_parts": total_parts,
+                "start_idx": start_num,
+                "end_idx": end_num,
+                "total_posts": total_posts_count
+            }
 
-        # Step 3: Text or Voice Delivery
-        if with_audio:
-            step3_text = (
-                f"🎙️ <b>Step 3/3:</b> Synthesizing voice using <b>{InputSanitizer.escape_html(voice_display_name)}</b>..."
-                if lang == "en" else
-                f"🎙️ <b>Шаг 3/3:</b> Озвучиваем голосом <b>{InputSanitizer.escape_html(voice_display_name)}</b>..."
+            if total_parts > 1:
+                step2_text = (
+                    f"🧠 <b>Issue {part_idx}/{total_parts}:</b> Gemini AI is analyzing stories {start_num}–{end_num} of {total_posts_count}..."
+                    if lang == "en" else
+                    f"🧠 <b>Выпуск {part_idx}/{total_parts}:</b> Gemini формирует выпуск (новости {start_num}–{end_num} из {total_posts_count})..."
+                )
+            else:
+                step2_text = (
+                    f"🧠 <b>Step 2/3:</b> Gemini AI is analyzing {len(chunk)} new posts from all channels..."
+                    if lang == "en" else
+                    f"🧠 <b>Шаг 2/3:</b> Gemini анализирует {len(chunk)} новых постов и формирует сценарий..."
+                )
+            await status_msg.edit_text(step2_text)
+
+            digest_text, clean_speech_text = await gemini_service.generate_digest(
+                posts=chunk,
+                style="podcast",
+                user_name=user_name,
+                lang=lang,
+                period_label=active_period_label,
+                part_info=part_info
             )
-            await status_msg.edit_text(step3_text)
-            
-            audio_path = await tts_service.synthesize_speech(
-                text=clean_speech_text,
-                voice=voice_id,
-                engine=engine
+
+            # Save to user session history
+            history_title_prefix = f"[Выпуск {part_idx}/{total_parts}] " if total_parts > 1 else ""
+            history_idx = await storage_service.save_user_digest(
+                user_id=user_id,
+                summary=f"{history_title_prefix}{digest_text}",
+                clean_speech=clean_speech_text,
+                voice_id=voice_id,
+                voice_name=voice_display_name,
+                channels=channels
             )
-            
-            header_str = (
-                f"📰 <b>News Digest ({len(posts)} posts from {len(channels)} channels):</b>\n\n{digest_text}"
-                if lang == "en" else
-                f"📰 <b>Сводка новостей ({len(posts)} постов из {len(channels)} каналов):</b>\n\n{digest_text}"
-            )
-            await send_smart_long_message(bot, chat_id, header_str)
-            
-            voice_file = FSInputFile(audio_path)
-            caption_str = (
-                f"🎙️ <i>Voiced by {InputSanitizer.escape_html(voice_display_name)}</i>"
-                if lang == "en" else
-                f"🎙️ <i>Озвучено голосом {InputSanitizer.escape_html(voice_display_name)}</i>"
-            )
-            await bot.send_voice(
-                chat_id,
-                voice=voice_file,
-                caption=caption_str,
-                reply_markup=get_digest_nav_keyboard(history_idx, total_history, lang)
-            )
-            
-            if os.path.exists(audio_path):
-                os.remove(audio_path)
-                
+            total_history = len(await storage_service.get_user_history(user_id))
+
+            # Mark processed chunk posts as seen for today
+            chunk_keys = [p.get("url") or f"{p.get('channel')}_{p.get('id')}" for p in chunk]
+            await storage_service.mark_posts_seen_today(user_id, chunk_keys)
+
+            part_header_tag_en = f"Part {part_idx}/{total_parts} (stories {start_num}–{end_num} of {total_posts_count})" if total_parts > 1 else f"{len(chunk)} posts from {len(channels)} channels"
+            part_header_tag_ru = f"Выпуск {part_idx}/{total_parts} (новости {start_num}–{end_num} из {total_posts_count})" if total_parts > 1 else f"{len(chunk)} постов из {len(channels)} каналов"
+
+            if with_audio:
+                if total_parts > 1:
+                    step3_text = (
+                        f"🎙️ <b>Issue {part_idx}/{total_parts}:</b> Synthesizing voice using <b>{InputSanitizer.escape_html(voice_display_name)}</b>..."
+                        if lang == "en" else
+                        f"🎙️ <b>Выпуск {part_idx}/{total_parts}:</b> Озвучиваем голосом <b>{InputSanitizer.escape_html(voice_display_name)}</b>..."
+                    )
+                else:
+                    step3_text = (
+                        f"🎙️ <b>Step 3/3:</b> Synthesizing voice using <b>{InputSanitizer.escape_html(voice_display_name)}</b>..."
+                        if lang == "en" else
+                        f"🎙️ <b>Шаг 3/3:</b> Озвучиваем голосом <b>{InputSanitizer.escape_html(voice_display_name)}</b>..."
+                    )
+                await status_msg.edit_text(step3_text)
+
+                audio_path = await tts_service.synthesize_speech(
+                    text=clean_speech_text,
+                    voice=voice_id,
+                    engine=engine
+                )
+
+                header_str = (
+                    f"📰 <b>News Digest — {part_header_tag_en}:</b>\n\n{digest_text}"
+                    if lang == "en" else
+                    f"📰 <b>Сводка новостей — {part_header_tag_ru}:</b>\n\n{digest_text}"
+                )
+                await send_smart_long_message(bot, chat_id, header_str)
+
+                voice_file = FSInputFile(audio_path)
+                part_caption_badge = f"Issue {part_idx}/{total_parts} • " if total_parts > 1 else ""
+                caption_str = (
+                    f"🎙️ <i>{part_caption_badge}Voiced by {InputSanitizer.escape_html(voice_display_name)}</i>"
+                    if lang == "en" else
+                    f"🎙️ <i>{part_caption_badge}Озвучено голосом {InputSanitizer.escape_html(voice_display_name)}</i>"
+                )
+                await bot.send_voice(
+                    chat_id,
+                    voice=voice_file,
+                    caption=caption_str,
+                    reply_markup=get_digest_nav_keyboard(history_idx, total_history, lang)
+                )
+
+                if os.path.exists(audio_path):
+                    os.remove(audio_path)
+            else:
+                header_str = (
+                    f"📰 <b>News Digest — {part_header_tag_en}:</b>\n\n{digest_text}"
+                    if lang == "en" else
+                    f"📰 <b>Сводка новостей — {part_header_tag_ru}:</b>\n\n{digest_text}"
+                )
+                await send_smart_long_message(
+                    bot,
+                    chat_id,
+                    header_str,
+                    reply_markup=get_digest_nav_keyboard(history_idx, total_history, lang)
+                )
+
+        try:
             await status_msg.delete()
-        else:
-            header_str = (
-                f"📰 <b>News Digest ({len(posts)} posts from {len(channels)} channels):</b>\n\n{digest_text}"
+        except Exception:
+            pass
+
+        if total_parts > 1:
+            done_msg = (
+                f"✅ <b>All {total_parts} editions for {active_period_label} completed!</b>\n"
+                f"Processed {total_posts_count} publications across your channels."
                 if lang == "en" else
-                f"📰 <b>Сводка новостей ({len(posts)} постов из {len(channels)} каналов):</b>\n\n{digest_text}"
+                f"✅ <b>Все {total_parts} выпуска дайджеста за {active_period_label} готовы!</b>\n"
+                f"Обработано {total_posts_count} публикаций из ваших каналов."
             )
-            await status_msg.delete()
-            await send_smart_long_message(
-                bot,
-                chat_id,
-                header_str,
-                reply_markup=get_digest_nav_keyboard(history_idx, total_history, lang)
-            )
+            await bot.send_message(chat_id, done_msg, reply_markup=get_main_keyboard(lang))
             
     except Exception as e:
         error_id = uuid.uuid4().hex[:8].upper()
