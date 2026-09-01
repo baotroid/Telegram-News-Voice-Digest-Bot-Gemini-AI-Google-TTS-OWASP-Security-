@@ -2006,7 +2006,7 @@ class TelegramReaderService:
 import os
 import re
 import html
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from google import genai
 from google.genai import types
 
