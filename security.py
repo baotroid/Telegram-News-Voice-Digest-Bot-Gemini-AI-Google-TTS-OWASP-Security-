@@ -195,10 +195,19 @@ class RateLimitMiddleware(BaseMiddleware):
                         parse_mode="HTML"
                     )
                 elif isinstance(event, CallbackQuery):
-                    await event.answer(
-                        "⏳ Слишком частые клики. Подождите секунду.",
-                        show_alert=True
-                    )
+                    try:
+                        await event.answer(
+                            "⏳ Слишком частые клики. Подождите секунду.",
+                            show_alert=False
+                        )
+                    except Exception:
+                        pass
+            else:
+                if isinstance(event, CallbackQuery):
+                    try:
+                        await event.answer()
+                    except Exception:
+                        pass
             return None
 
         timestamps.append(now)

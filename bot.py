@@ -598,6 +598,10 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
 
     try:
         if data == "get_audio_digest":
+            try:
+                await callback.answer()
+            except Exception:
+                pass
             lang = await storage_service.get_user_lang(user_id)
             prompt_text = (
                 "📅 <b>Select Digest Timeframe:</b>\n\n"
@@ -608,9 +612,12 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
                 "или на <b>сегодняшний и вчерашний день</b> (48ч)?"
             )
             await callback.message.answer(prompt_text, reply_markup=get_period_keyboard(with_audio=True, lang=lang))
-            await callback.answer()
 
         elif data == "get_text_digest":
+            try:
+                await callback.answer()
+            except Exception:
+                pass
             lang = await storage_service.get_user_lang(user_id)
             prompt_text = (
                 "📅 <b>Select Text Digest Timeframe:</b>\n\n"
@@ -621,23 +628,28 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
                 "или на <b>сегодняшний и вчерашний день</b> (48ч)?"
             )
             await callback.message.answer(prompt_text, reply_markup=get_period_keyboard(with_audio=False, lang=lang))
-            await callback.answer()
 
         elif data.startswith("news_period:"):
-            # Format: news_period:today:audio or news_period:today_yesterday:text
+            # Format: news_period:today:audio, news_period:today_yesterday:text, or news_period:force_today:audio
             parts = data.split(":")
             period_type = parts[1] if len(parts) > 1 else "today"
             mode = parts[2] if len(parts) > 2 else "audio"
             with_audio = (mode == "audio")
-            hours_limit = 48 if period_type == "today_yesterday" else 24
+            force_regenerate = period_type.startswith("force_")
+            clean_period = period_type.replace("force_", "")
+            hours_limit = 48 if clean_period == "today_yesterday" else 24
             
-            await callback.answer("⏳ Запускаем обработку..." if (await storage_service.get_user_lang(user_id)) == "ru" else "⏳ Processing digest...")
+            try:
+                await callback.answer("⏳ Запускаем обработку..." if (await storage_service.get_user_lang(user_id)) == "ru" else "⏳ Processing digest...")
+            except Exception:
+                pass
             await process_digest_request(
                 user_id=user_id,
                 chat_id=chat_id,
                 user_name=user_name,
                 with_audio=with_audio,
-                hours_limit=hours_limit
+                hours_limit=hours_limit,
+                force_regenerate=force_regenerate
             )
 
         elif data == "open_lang_menu":
@@ -845,7 +857,8 @@ async def process_digest_request(
     chat_id: int,
     user_name: str,
     with_audio: bool = True,
-    hours_limit: int = 24
+    hours_limit: int = 24,
+    force_regenerate: bool = False
 ):
     lang = await storage_service.get_user_lang(user_id)
     prep_text = (
@@ -934,30 +947,44 @@ async def process_digest_request(
             await status_msg.edit_text(no_subst_text, reply_markup=get_main_keyboard(lang))
             return
 
-        # Deduplication: Exclude posts that were already included in earlier digests today
-        seen_posts_today = await storage_service.get_user_seen_posts_today(user_id)
-        unseen_posts = []
-        for p in posts:
-            p_key = p.get("url") or f"{p.get('channel')}_{p.get('id')}"
-            if p_key not in seen_posts_today:
-                unseen_posts.append(p)
+        # Deduplication: Exclude posts that were already included in earlier digests today unless force_regenerate is requested
+        if not force_regenerate:
+            seen_posts_today = await storage_service.get_user_seen_posts_today(user_id)
+            unseen_posts = []
+            for p in posts:
+                p_key = p.get("url") or f"{p.get('channel')}_{p.get('id')}"
+                if p_key not in seen_posts_today:
+                    unseen_posts.append(p)
 
-        if not unseen_posts:
-            all_caught_up_text = (
-                f"✨ <b>All caught up!</b>\n\n"
-                f"No new posts in your tracked channels ({len(channels)}) since your previous digest today.\n"
-                f"All {len(posts)} publications from today were already included in your earlier digests.\n\n"
-                f"💡 <i>Tip: You can re-listen to previous digests in 📚 <b>Archive</b> or request again later when fresh news arrives.</i>"
-                if lang == "en" else
-                f"✨ <b>Вы уже в курсе всех новостей за сегодня!</b>\n\n"
-                f"В ваших каналах ({len(channels)} шт.) нет новых публикаций с момента предыдущего дайджеста за сегодня.\n"
-                f"Все публикации ({len(posts)} шт.) уже вошли в ваши более ранние выпуски.\n\n"
-                f"💡 <i>Совет: Вы можете прослушать предыдущие выпуски в 📚 <b>Архиве</b> или запросить новый дайджест позже, когда появятся свежие публикации.</i>"
-            )
-            await status_msg.edit_text(all_caught_up_text, reply_markup=get_main_keyboard(lang))
-            return
+            if not unseen_posts:
+                all_caught_up_text = (
+                    f"✨ <b>All caught up!</b>\n\n"
+                    f"No new posts in your tracked channels ({len(channels)}) since your previous digest today.\n"
+                    f"All {len(posts)} publications from today were already included in your earlier digests.\n\n"
+                    f"💡 <i>Tip: You can re-listen in 📚 <b>Archive</b> or force a fresh re-generation right now:</i>"
+                    if lang == "en" else
+                    f"✨ <b>Вы уже в курсе всех новостей за сегодня!</b>\n\n"
+                    f"В ваших каналах ({len(channels)} шт.) нет новых публикаций с момента предыдущего дайджеста за сегодня.\n"
+                    f"Все публикации ({len(posts)} шт.) уже вошли в ваши более ранние выпуски.\n\n"
+                    f"💡 <i>Совет: Вы можете прослушать предыдущие выпуски в 📚 <b>Архиве</b> или принудительно пересоздать выпуск кнопкой ниже:</i>"
+                )
+                recreate_period = "today_yesterday" if hours_limit == 48 else "today"
+                recreate_mode = "audio" if with_audio else "text"
+                recreate_markup = InlineKeyboardMarkup(inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔄 Сформировать повторно" if lang == "ru" else "🔄 Force Re-generate",
+                            callback_data=f"news_period:force_{recreate_period}:{recreate_mode}"
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(text="🏠 Главное меню" if lang == "ru" else "🏠 Main Menu", callback_data="main_menu")
+                    ]
+                ])
+                await status_msg.edit_text(all_caught_up_text, reply_markup=recreate_markup)
+                return
 
-        posts = unseen_posts
+            posts = unseen_posts
 
         # Dynamic Batching: Split into issues if total news > 24
         MAX_POSTS_PER_PART = 24
@@ -1184,10 +1211,32 @@ async def start_healthcheck_server(port: int = 10000):
     logger.info(f"Render/Cloud HTTP Health Check server successfully started on port {port} (0.0.0.0:{port})")
     return runner
 
+async def start_keepalive_task():
+    """
+    Prevents Render Free tier from spinning down due to HTTP inactivity.
+    Render automatically provides RENDER_EXTERNAL_URL (e.g. https://xyz.onrender.com).
+    """
+    external_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SELF_PING_URL")
+    if not external_url:
+        return
+        
+    ping_endpoint = external_url.rstrip("/") + "/health"
+    logger.info(f"Render keepalive self-ping task activated for: {ping_endpoint}")
+    await asyncio.sleep(60)
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(ping_endpoint, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    logger.debug(f"Render keepalive ping: HTTP {resp.status}")
+        except Exception as e:
+            logger.debug(f"Render keepalive ping notice: {e}")
+        await asyncio.sleep(600)
+
 async def main():
     # Detect port from Render/Cloud environment (default: 10000 on Render)
     port = int(os.environ.get("PORT", 10000))
     runner = None
+    keepalive_task = None
     try:
         runner = await start_healthcheck_server(port=port)
     except Exception as e:
@@ -1199,11 +1248,15 @@ async def main():
     logger.info("Starting Telegram reader service...")
     await reader_service.start()
     
+    keepalive_task = asyncio.create_task(start_keepalive_task())
+    
     logger.info("Starting Aiogram bot polling with OWASP Security Middlewares active...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot, drop_pending_updates=True)
     finally:
+        if keepalive_task:
+            keepalive_task.cancel()
         await reader_service.stop()
         await bot.session.close()
         if runner:
