@@ -836,8 +836,50 @@ async def cmd_voice(message: types.Message):
     await message.answer(text, reply_markup=get_voice_keyboard(current_voice, lang))
 
 # ---------------------------------------------------------------------------
-# Diagnostics & Logs Handler (Command /logs)
+# Diagnostics & Logs Handler (Command /logs, /status)
 # ---------------------------------------------------------------------------
+@dp.message(Command("status"), PrivateChatOnlyFilter())
+@dp.message(Command("ping"), PrivateChatOnlyFilter())
+async def cmd_status(message: types.Message):
+    user_id = message.from_user.id
+    lang = await storage_service.get_user_lang(user_id)
+    ext_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SELF_PING_URL")
+    health_url = f"{ext_url.rstrip('/')}/health" if ext_url else None
+    
+    if lang == "en":
+        status_text = (
+            f"🟢 <b>Bot & Server Health Status:</b>\\n\\n"
+            f"• Operational State: <b>Online (Polling Active)</b>\\n"
+            f"• Port: <code>{os.environ.get('PORT', 10000)}</code>\\n"
+        )
+        if health_url:
+            status_text += (
+                f"• Public Health Endpoint:\\n<code>{health_url}</code>\\n\\n"
+                f"💡 <i>Use this exact URL in UptimeRobot to keep the service alive 24/7!</i>"
+            )
+        else:
+            status_text += (
+                f"• Public URL: <i>Check Render dashboard (under service title: https://...onrender.com)</i>\\n"
+                f"💡 <i>Append <code>/health</code> to your .onrender.com address for UptimeRobot.</i>"
+            )
+    else:
+        status_text = (
+            f"🟢 <b>Статус бота и сервера:</b>\\n\\n"
+            f"• Состояние: <b>В сети (Polling активен)</b>\\n"
+            f"• Порт Healthcheck: <code>{os.environ.get('PORT', 10000)}</code>\\n"
+        )
+        if health_url:
+            status_text += (
+                f"• Публичный адрес для мониторинга:\\n<code>{health_url}</code>\\n\\n"
+                f"💡 <i>Используйте именно этот адрес в UptimeRobot для непрерывной работы 24/7!</i>"
+            )
+        else:
+            status_text += (
+                f"• Публичный URL: <i>Посмотрите в Render под заголовком (ссылка https://...onrender.com)</i>\\n"
+                f"💡 <i>Добавьте <code>/health</code> к вашему адресу .onrender.com для UptimeRobot.</i>"
+            )
+    await message.answer(status_text)
+
 @dp.message(Command("logs"), PrivateChatOnlyFilter())
 async def cmd_logs(message: types.Message):
     """Sends the last 30 log lines or the full bot.log file."""
@@ -1219,24 +1261,24 @@ async def process_digest_request(
             await status_msg.edit_text(no_posts_text, reply_markup=get_main_keyboard(lang))
             return
 
-        # Deduplication: Exclude posts that were already included in earlier digests today
-        seen_posts_today = await storage_service.get_user_seen_posts_today(user_id)
+        # Deduplication: Exclude posts that were already included in previous digests
+        seen_posts = await storage_service.get_user_seen_post_keys(user_id)
         unseen_posts = []
         for p in posts:
             p_key = p.get("url") or f"{p.get('channel')}_{p.get('id')}"
-            if p_key not in seen_posts_today:
+            if p_key not in seen_posts:
                 unseen_posts.append(p)
 
         if not unseen_posts:
             all_caught_up_text = (
                 f"✨ <b>All caught up!</b>\\n\\n"
-                f"No new posts in your tracked channels ({len(channels)}) since your previous digest today.\\n"
-                f"All {len(posts)} publications from today were already included in your earlier digests.\\n\\n"
-                f"💡 <i>Tip: You can re-listen to previous digests in 📚 <b>Archive</b> or request again later when fresh news arrives.</i>"
+                f"No new posts in your tracked channels ({len(channels)}) since your previous digests.\\n"
+                f"All {len(posts)} publications from the selected window were already included in your earlier digests.\\n\\n"
+                f"💡 <i>Tip: You can re-listen in 📚 <b>Archive</b> or request again later when fresh news arrives.</i>"
                 if lang == "en" else
-                f"✨ <b>Вы уже в курсе всех новостей за сегодня!</b>\\n\\n"
-                f"В ваших каналах ({len(channels)} шт.) нет новых публикаций с момента предыдущего дайджеста за сегодня.\\n"
-                f"Все публикации ({len(posts)} шт.) уже вошли в ваши более ранние выпуски.\\n\\n"
+                f"✨ <b>Вы уже в курсе всех новостей!</b>\\n\\n"
+                f"В ваших каналах ({len(channels)} шт.) нет новых публикаций с момента предыдущего дайджеста.\\n"
+                f"Все публикации ({len(posts)} шт.) за выбранный период уже вошли в ваши более ранние выпуски.\\n\\n"
                 f"💡 <i>Совет: Вы можете прослушать предыдущие выпуски в 📚 <b>Архиве</b> или запросить новый дайджест позже, когда появятся свежие публикации.</i>"
             )
             await status_msg.edit_text(all_caught_up_text, reply_markup=get_main_keyboard(lang))
@@ -1272,9 +1314,9 @@ async def process_digest_request(
         )
         total_history = len(await storage_service.get_user_history(user_id))
 
-        # Mark all included posts as seen for today
+        # Mark all included posts as seen
         new_seen_keys = [p.get("url") or f"{p.get('channel')}_{p.get('id')}" for p in posts]
-        await storage_service.mark_posts_seen_today(user_id, new_seen_keys)
+        await storage_service.mark_posts_seen(user_id, new_seen_keys)
 
         # Step 3: Text or Voice Delivery
         if with_audio:
@@ -1623,41 +1665,66 @@ class StorageService:
         async with self._lock:
             return len(self._data.get("users", {}))
 
-    async def get_user_seen_posts_today(self, user_id: int) -> set:
-        import datetime
-        today_str = datetime.date.today().isoformat()
+    async def get_storage_stats(self) -> dict:
+        import time
+        now = time.time()
         async with self._lock:
-            user = self._get_or_create_user(user_id)
-            seen_dict = user.get("seen_posts_by_date", {})
-            return set(seen_dict.get(today_str, []))
+            users = self._data.get("users", {})
+            total_users = len(users)
+            total_digests = sum(len(u.get("history", [])) for u in users.values())
+            active_users_24h = sum(1 for u in users.values() if u.get("history") and (now - u["history"][-1].get("created_at", 0) < 86400))
+            return {
+                "total_users": total_users,
+                "total_digests": total_digests,
+                "active_users_24h": active_users_24h
+            }
 
-    async def mark_posts_seen_today(self, user_id: int, post_keys: List[str]):
-        import datetime
-        today_str = datetime.date.today().isoformat()
+    async def get_user_seen_post_keys(self, user_id: int) -> set:
+        import time
+        cutoff_time = time.time() - (14 * 86400)
         async with self._lock:
             user = self._get_or_create_user(user_id)
-            if "seen_posts_by_date" not in user:
-                user["seen_posts_by_date"] = {}
-            current_seen = set(user["seen_posts_by_date"].get(today_str, []))
-            current_seen.update(post_keys)
-            user["seen_posts_by_date"][today_str] = list(current_seen)
-            
-            # Prune older dates (keep only last 3 days)
-            all_dates = sorted(user["seen_posts_by_date"].keys())
-            if len(all_dates) > 3:
-                for old_date in all_dates[:-3]:
-                    user["seen_posts_by_date"].pop(old_date, None)
-                    
+            seen_set = set()
+            for k, ts in user.get("seen_posts", {}).items():
+                if isinstance(ts, (int, float)) and ts >= cutoff_time:
+                    seen_set.add(k)
+                elif isinstance(ts, str):
+                    seen_set.add(k)
+            for posts_list in user.get("seen_posts_by_date", {}).values():
+                if isinstance(posts_list, list):
+                    seen_set.update(posts_list)
+            return seen_set
+
+    async def mark_posts_seen(self, user_id: int, post_keys: List[str]):
+        import time
+        now = time.time()
+        cutoff_time = now - (14 * 86400)
+        async with self._lock:
+            user = self._get_or_create_user(user_id)
+            if "seen_posts" not in user:
+                user["seen_posts"] = {}
+            for pk in post_keys:
+                if pk:
+                    user["seen_posts"][pk] = now
+            if len(user["seen_posts"]) > 2000:
+                user["seen_posts"] = {k: v for k, v in user["seen_posts"].items() if isinstance(v, (int, float)) and v >= cutoff_time}
             await self._save_unlocked()
 
-    async def clear_user_seen_posts_today(self, user_id: int):
-        import datetime
-        today_str = datetime.date.today().isoformat()
+    async def clear_user_seen_posts(self, user_id: int):
         async with self._lock:
             user = self._get_or_create_user(user_id)
-            if "seen_posts_by_date" in user and today_str in user["seen_posts_by_date"]:
-                user["seen_posts_by_date"][today_str] = []
-                await self._save_unlocked()
+            user["seen_posts"] = {}
+            user["seen_posts_by_date"] = {}
+            await self._save_unlocked()
+
+    async def get_user_seen_posts_today(self, user_id: int) -> set:
+        return await self.get_user_seen_post_keys(user_id)
+
+    async def mark_posts_seen_today(self, user_id: int, post_keys: List[str]):
+        await self.mark_posts_seen(user_id, post_keys)
+
+    async def clear_user_seen_posts_today(self, user_id: int):
+        await self.clear_user_seen_posts(user_id)
 
 storage_service = StorageService()
 `;

@@ -195,40 +195,100 @@ class StorageService:
         async with self._lock:
             return len(self._data.get("users", {}))
 
-    async def get_user_seen_posts_today(self, user_id: int) -> set:
-        import datetime
-        today_str = datetime.date.today().isoformat()
+    async def get_storage_stats(self) -> Dict[str, Any]:
+        """Returns high-level statistics for bot administrator/diagnostics."""
+        import time
+        now = time.time()
         async with self._lock:
-            user = self._get_or_create_user(user_id)
-            seen_dict = user.get("seen_posts_by_date", {})
-            return set(seen_dict.get(today_str, []))
+            users = self._data.get("users", {})
+            total_users = len(users)
+            total_digests = 0
+            active_users_24h = 0
+            for u in users.values():
+                hist = u.get("history", [])
+                total_digests += len(hist)
+                if hist and (now - hist[-1].get("created_at", 0) < 86400):
+                    active_users_24h += 1
+            return {
+                "total_users": total_users,
+                "total_digests": total_digests,
+                "active_users_24h": active_users_24h
+            }
 
-    async def mark_posts_seen_today(self, user_id: int, post_keys: List[str]):
-        import datetime
-        today_str = datetime.date.today().isoformat()
+    async def get_user_seen_post_keys(self, user_id: int) -> set:
+        """
+        Returns a set of all canonical post keys already included in any previous digest
+        for this user (retaining history for up to 14 days). Prevents duplicate news across 24h/48h periods.
+        """
+        import time
+        cutoff_time = time.time() - (14 * 86400)
         async with self._lock:
             user = self._get_or_create_user(user_id)
-            if "seen_posts_by_date" not in user:
-                user["seen_posts_by_date"] = {}
-            current_seen = set(user["seen_posts_by_date"].get(today_str, []))
-            current_seen.update(post_keys)
-            user["seen_posts_by_date"][today_str] = list(current_seen)
-            
-            # Prune older dates (keep only last 3 days)
-            all_dates = sorted(user["seen_posts_by_date"].keys())
-            if len(all_dates) > 3:
-                for old_date in all_dates[:-3]:
-                    user["seen_posts_by_date"].pop(old_date, None)
-                    
+            seen_set = set()
+
+            # 1. New persistent seen_posts dict: {post_key: timestamp}
+            seen_dict = user.get("seen_posts", {})
+            for k, ts in seen_dict.items():
+                if isinstance(ts, (int, float)) and ts >= cutoff_time:
+                    seen_set.add(k)
+                elif isinstance(ts, str):
+                    seen_set.add(k)
+
+            # 2. Legacy seen_posts_by_date support (date strings e.g. "2026-09-03")
+            legacy_dict = user.get("seen_posts_by_date", {})
+            for date_key, posts_list in legacy_dict.items():
+                if isinstance(posts_list, list):
+                    seen_set.update(posts_list)
+
+            return seen_set
+
+    async def mark_posts_seen(self, user_id: int, post_keys: List[str]):
+        """
+        Marks post keys as permanently seen for this user with current timestamp.
+        Automatically prunes records older than 14 days or keeping up to 2000 keys.
+        """
+        import time
+        now = time.time()
+        cutoff_time = now - (14 * 86400)
+        async with self._lock:
+            user = self._get_or_create_user(user_id)
+            if "seen_posts" not in user:
+                user["seen_posts"] = {}
+
+            # Add newly processed post keys with timestamp
+            for pk in post_keys:
+                if pk:
+                    user["seen_posts"][pk] = now
+
+            # Prune posts older than 14 days or beyond 2000 items
+            if len(user["seen_posts"]) > 2000:
+                user["seen_posts"] = {
+                    k: v for k, v in user["seen_posts"].items()
+                    if isinstance(v, (int, float)) and v >= cutoff_time
+                }
+                # If still over 2000, keep latest 2000
+                if len(user["seen_posts"]) > 2000:
+                    sorted_items = sorted(user["seen_posts"].items(), key=lambda x: x[1], reverse=True)[:2000]
+                    user["seen_posts"] = dict(sorted_items)
+
             await self._save_unlocked()
 
-    async def clear_user_seen_posts_today(self, user_id: int):
-        import datetime
-        today_str = datetime.date.today().isoformat()
+    async def clear_user_seen_posts(self, user_id: int):
+        """Clears all seen posts tracking for the user."""
         async with self._lock:
             user = self._get_or_create_user(user_id)
-            if "seen_posts_by_date" in user and today_str in user["seen_posts_by_date"]:
-                user["seen_posts_by_date"][today_str] = []
-                await self._save_unlocked()
+            user["seen_posts"] = {}
+            user["seen_posts_by_date"] = {}
+            await self._save_unlocked()
+
+    # Backward compatibility aliases
+    async def get_user_seen_posts_today(self, user_id: int) -> set:
+        return await self.get_user_seen_post_keys(user_id)
+
+    async def mark_posts_seen_today(self, user_id: int, post_keys: List[str]):
+        await self.mark_posts_seen(user_id, post_keys)
+
+    async def clear_user_seen_posts_today(self, user_id: int):
+        await self.clear_user_seen_posts(user_id)
 
 storage_service = StorageService()

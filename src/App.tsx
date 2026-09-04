@@ -22,7 +22,7 @@ export default function App() {
   const [isGenerating, setIsGenerating] = useState<boolean>(false);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isIconModalOpen, setIsIconModalOpen] = useState<boolean>(false);
-  const [selectedIconId, setSelectedIconId] = useState<string>('variant-1');
+  const [selectedIconId, setSelectedIconId] = useState<string>('silver-stand-circle');
 
   const selectedIcon = BOT_ICON_VARIANTS.find((v) => v.id === selectedIconId) || BOT_ICON_VARIANTS[0];
 

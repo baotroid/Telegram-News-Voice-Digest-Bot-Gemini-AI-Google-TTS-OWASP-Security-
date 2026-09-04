@@ -514,8 +514,63 @@ async def cmd_voice(message: types.Message):
     await message.answer(text, reply_markup=get_voice_keyboard(current_voice, lang))
 
 # ---------------------------------------------------------------------------
-# Diagnostics & Logs Handler (Command /logs)
+# Diagnostics & Logs Handler (Command /logs, /status)
 # ---------------------------------------------------------------------------
+@dp.message(Command("status"), PrivateChatOnlyFilter())
+@dp.message(Command("stats"), PrivateChatOnlyFilter())
+@dp.message(Command("users"), PrivateChatOnlyFilter())
+@dp.message(Command("ping"), PrivateChatOnlyFilter())
+async def cmd_status(message: types.Message):
+    user_id = message.from_user.id
+    lang = await storage_service.get_user_lang(user_id)
+    stats = await storage_service.get_storage_stats()
+    ext_url = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("SELF_PING_URL")
+    health_url = f"{ext_url.rstrip('/')}/health" if ext_url else None
+    
+    total_users = stats.get("total_users", 0)
+    total_digests = stats.get("total_digests", 0)
+    active_users = stats.get("active_users_24h", 0)
+
+    if lang == "en":
+        status_text = (
+            f"📊 <b>Bot Statistics & Operational Health:</b>\n\n"
+            f"👥 <b>Connected Users:</b> <code>{total_users}</code>\n"
+            f"⚡ <b>Active in last 24h:</b> <code>{active_users}</code>\n"
+            f"🎙️ <b>Total Digests Generated:</b> <code>{total_digests}</code>\n\n"
+            f"• Operational State: <b>Online (Polling Active)</b>\n"
+            f"• Port: <code>{os.environ.get('PORT', 10000)}</code>\n"
+        )
+        if health_url:
+            status_text += (
+                f"• Public Health Endpoint:\n<code>{health_url}</code>\n\n"
+                f"💡 <i>Use this exact URL in UptimeRobot to keep the service alive 24/7!</i>"
+            )
+        else:
+            status_text += (
+                f"• Public URL: <i>Check Render dashboard (under service title: https://...onrender.com)</i>\n"
+                f"💡 <i>Append <code>/health</code> to your .onrender.com address for UptimeRobot.</i>"
+            )
+    else:
+        status_text = (
+            f"📊 <b>Статистика и состояние бота:</b>\n\n"
+            f"👥 <b>Подключенных пользователей:</b> <code>{total_users}</code>\n"
+            f"⚡ <b>Активных за 24 часа:</b> <code>{active_users}</code>\n"
+            f"🎙️ <b>Сформировано дайджестов:</b> <code>{total_digests}</code>\n\n"
+            f"• Состояние: <b>В сети (Polling активен)</b>\n"
+            f"• Порт Healthcheck: <code>{os.environ.get('PORT', 10000)}</code>\n"
+        )
+        if health_url:
+            status_text += (
+                f"• Публичный адрес для мониторинга:\n<code>{health_url}</code>\n\n"
+                f"💡 <i>Используйте именно этот адрес в UptimeRobot для непрерывной работы 24/7!</i>"
+            )
+        else:
+            status_text += (
+                f"• Публичный URL: <i>Посмотрите в Render под заголовком (ссылка https://...onrender.com)</i>\n"
+                f"💡 <i>Добавьте <code>/health</code> к вашему адресу .onrender.com для UptimeRobot.</i>"
+            )
+    await message.answer(status_text)
+
 @dp.message(Command("logs"), PrivateChatOnlyFilter())
 async def cmd_logs(message: types.Message):
     """Sends the last 30 log lines or the full bot.log file."""
@@ -852,6 +907,24 @@ async def handle_callbacks(callback: types.CallbackQuery, state: FSMContext):
 # ---------------------------------------------------------------------------
 # Core Digest Pipeline with Secure Exception Handling
 # ---------------------------------------------------------------------------
+def get_post_unique_key(post: Dict[str, Any]) -> str:
+    """
+    Generates a normalized, canonical unique key for a post to prevent duplicates
+    across consecutive digests regardless of 24h/48h window selection.
+    """
+    url = (post.get("url") or "").strip().lower()
+    if url:
+        clean = re.sub(r'^https?://t\.me/(s/)?', '', url).strip('/')
+        if clean:
+            return clean
+    ch = str(post.get("channel", "")).replace("@", "").strip().lower()
+    pid = str(post.get("id", "")).strip().lower()
+    if ch and pid:
+        return f"{ch}/{pid}"
+    import hashlib
+    txt = (post.get("text") or "")[:120].strip().lower()
+    return f"{ch}:{hashlib.md5(txt.encode('utf-8')).hexdigest()}"
+
 async def process_digest_request(
     user_id: int,
     chat_id: int,
@@ -947,26 +1020,26 @@ async def process_digest_request(
             await status_msg.edit_text(no_subst_text, reply_markup=get_main_keyboard(lang))
             return
 
-        # Deduplication: Exclude posts that were already included in earlier digests today unless force_regenerate is requested
+        # Deduplication: Exclude posts that were already included in earlier digests unless force_regenerate is requested
         if not force_regenerate:
-            seen_posts_today = await storage_service.get_user_seen_posts_today(user_id)
+            seen_posts = await storage_service.get_user_seen_post_keys(user_id)
             unseen_posts = []
             for p in posts:
-                p_key = p.get("url") or f"{p.get('channel')}_{p.get('id')}"
-                if p_key not in seen_posts_today:
+                p_key = get_post_unique_key(p)
+                if p_key not in seen_posts:
                     unseen_posts.append(p)
 
             if not unseen_posts:
                 all_caught_up_text = (
                     f"✨ <b>All caught up!</b>\n\n"
-                    f"No new posts in your tracked channels ({len(channels)}) since your previous digest today.\n"
-                    f"All {len(posts)} publications from today were already included in your earlier digests.\n\n"
+                    f"No new posts in your tracked channels ({len(channels)}) since your previous digests.\n"
+                    f"All {len(posts)} publications from the selected window were already included in your earlier digests.\n\n"
                     f"💡 <i>Tip: You can re-listen in 📚 <b>Archive</b> or force a fresh re-generation right now:</i>"
                     if lang == "en" else
-                    f"✨ <b>Вы уже в курсе всех новостей за сегодня!</b>\n\n"
-                    f"В ваших каналах ({len(channels)} шт.) нет новых публикаций с момента предыдущего дайджеста за сегодня.\n"
-                    f"Все публикации ({len(posts)} шт.) уже вошли в ваши более ранние выпуски.\n\n"
-                    f"💡 <i>Совет: Вы можете прослушать предыдущие выпуски в 📚 <b>Архиве</b> или принудительно пересоздать выпуск кнопкой ниже:</i>"
+                    f"✨ <b>Вы уже в курсе всех новостей!</b>\n\n"
+                    f"В ваших каналах ({len(channels)} шт.) нет новых публикаций с момента предыдущего дайджеста.\n"
+                    f"Все публикации ({len(posts)} шт.) за выбранный период уже вошли в ваши более ранние выпуски.\n\n"
+                    f"💡 <i>Совет: Вы можете прослушать предыдущие выпуски в 📚 <b>Архиве</b> или принудительно сформировать повторно кнопкой ниже:</i>"
                 )
                 recreate_period = "today_yesterday" if hours_limit == 48 else "today"
                 recreate_mode = "audio" if with_audio else "text"
@@ -1043,9 +1116,9 @@ async def process_digest_request(
             )
             total_history = len(await storage_service.get_user_history(user_id))
 
-            # Mark processed chunk posts as seen for today
-            chunk_keys = [p.get("url") or f"{p.get('channel')}_{p.get('id')}" for p in chunk]
-            await storage_service.mark_posts_seen_today(user_id, chunk_keys)
+            # Mark processed chunk posts as permanently seen for this user
+            chunk_keys = [get_post_unique_key(p) for p in chunk]
+            await storage_service.mark_posts_seen(user_id, chunk_keys)
 
             part_header_tag_en = f"Part {part_idx}/{total_parts} (stories {start_num}–{end_num} of {total_posts_count})" if total_parts > 1 else f"{len(chunk)} posts from {len(channels)} channels"
             part_header_tag_ru = f"Выпуск {part_idx}/{total_parts} (новости {start_num}–{end_num} из {total_posts_count})" if total_parts > 1 else f"{len(chunk)} постов из {len(channels)} каналов"
