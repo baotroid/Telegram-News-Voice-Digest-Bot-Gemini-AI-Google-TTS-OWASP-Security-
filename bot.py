@@ -1331,6 +1331,7 @@ async def main():
         if keepalive_task:
             keepalive_task.cancel()
         await reader_service.stop()
+        await storage_service.close()
         await bot.session.close()
         if runner:
             await runner.cleanup()

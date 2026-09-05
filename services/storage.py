@@ -13,37 +13,111 @@ DEFAULT_ENGINE = "gtts"
 
 class StorageService:
     """
-    Asynchronous encrypted user storage (JSON/SQLite).
-    Implements PII protection: stores channel subscriptions encrypted via AES/Fernet.
-    Avoids deadlocks by separating unlocked internal queries from locked public interfaces.
+    Asynchronous user storage supporting both PostgreSQL (Cloud DB) and JSON file.
+    If DATABASE_URL is provided (e.g. on Render PostgreSQL), it automatically persists
+    data in the cloud database, surviving any code updates or container restarts.
     """
-    def __init__(self, db_path: str = "data/user_storage.json", encryption_key: str = ""):
-        self.db_path = db_path
+    def __init__(self, db_path: Optional[str] = None, encryption_key: str = ""):
+        env_db_path = os.environ.get("STORAGE_DB_PATH") or os.environ.get("DATA_PATH")
+        self.db_path = db_path or env_db_path or "data/user_storage.json"
+        self.database_url = os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL") or ""
         self._data: Dict[str, Any] = {"users": {}}
         self._lock = asyncio.Lock()
-        self.vault = DataSecurityVault(master_key=encryption_key)
+        self._pg_pool = None
+        self.vault = DataSecurityVault(master_key=encryption_key or os.environ.get("ENCRYPTION_KEY", ""))
         
     async def init_db(self):
-        os.makedirs(os.path.dirname(self.db_path) if os.path.dirname(self.db_path) else ".", exist_ok=True)
-        if os.path.exists(self.db_path):
+        # 1. First attempt to connect to PostgreSQL if DATABASE_URL is configured
+        if self.database_url:
             try:
-                with open(self.db_path, "r", encoding="utf-8") as f:
-                    self._data = json.load(f)
+                import asyncpg
+                # Normalize URL for asyncpg (postgres:// -> postgresql://)
+                pg_url = self.database_url
+                if pg_url.startswith("postgres://"):
+                    pg_url = pg_url.replace("postgres://", "postgresql://", 1)
+                
+                self._pg_pool = await asyncpg.create_pool(dsn=pg_url, min_size=1, max_size=5, timeout=10)
+                async with self._pg_pool.acquire() as conn:
+                    await conn.execute("""
+                        CREATE TABLE IF NOT EXISTS bot_storage (
+                            id VARCHAR(64) PRIMARY KEY,
+                            data JSONB NOT NULL,
+                            updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+                        );
+                    """)
+                    row = await conn.fetchrow("SELECT data FROM bot_storage WHERE id = 'main'")
+                    if row and row["data"]:
+                        pg_data = row["data"]
+                        if isinstance(pg_data, str):
+                            self._data = json.loads(pg_data)
+                        elif isinstance(pg_data, dict):
+                            self._data = pg_data
+                        logger.info("Successfully loaded bot data from cloud PostgreSQL!")
+                    else:
+                        logger.info("PostgreSQL storage initialized (fresh table).")
             except Exception as e:
-                logger.warning(f"Error reading storage file: {e}. Starting fresh.")
-                self._data = {"users": {}}
-        else:
-            await self._save_unlocked()
-        logger.info("Storage service initialized.")
+                logger.error(f"Failed to connect to PostgreSQL: {e}. Falling back to local file storage.")
+                self._pg_pool = None
+
+        # 2. If PostgreSQL was not available or empty, check local file
+        if not self._data.get("users"):
+            os.makedirs(os.path.dirname(self.db_path) if os.path.dirname(self.db_path) else ".", exist_ok=True)
+            if os.path.exists(self.db_path):
+                try:
+                    with open(self.db_path, "r", encoding="utf-8") as f:
+                        self._data = json.load(f)
+                        logger.info(f"Loaded storage data from local file {self.db_path}")
+                except Exception as e:
+                    logger.warning(f"Error reading storage file: {e}. Starting fresh.")
+                    self._data = {"users": {}}
+            else:
+                await self._save_unlocked()
+
+        # If data was loaded from file and PostgreSQL is active, push file data to cloud
+        if self._pg_pool and self._data.get("users"):
+            try:
+                await self._save_to_postgres(self._data)
+            except Exception:
+                pass
+
+        logger.info(f"Storage service ready (PostgreSQL: {'Enabled' if self._pg_pool else 'Disabled'}, Local file: {self.db_path})")
+
+    async def _save_to_postgres(self, data: dict):
+        if not self._pg_pool:
+            return
+        try:
+            payload = json.dumps(data, ensure_ascii=False)
+            async with self._pg_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO bot_storage (id, data, updated_at)
+                    VALUES ('main', $1::jsonb, NOW())
+                    ON CONFLICT (id) DO UPDATE 
+                    SET data = EXCLUDED.data, updated_at = NOW();
+                """, payload)
+        except Exception as e:
+            logger.error(f"Error persisting data to PostgreSQL: {e}")
 
     async def _save_unlocked(self):
-        with open(self.db_path, "w", encoding="utf-8") as f:
-            json.dump(self._data, f, ensure_ascii=False, indent=2)
+        # 1. Save to local file as immediate snapshot
+        try:
+            os.makedirs(os.path.dirname(self.db_path) if os.path.dirname(self.db_path) else ".", exist_ok=True)
+            with open(self.db_path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"Failed to save storage data to {self.db_path}: {e}")
+
+        # 2. Save to PostgreSQL if connected
+        if self._pg_pool:
+            try:
+                await self._save_to_postgres(self._data)
+            except Exception as e:
+                logger.error(f"Failed async update to PostgreSQL: {e}")
 
     def _get_or_create_user(self, user_id: int) -> Dict[str, Any]:
         uid = str(user_id)
         if uid not in self._data["users"]:
             self._data["users"][uid] = {
+                "channels": list(DEFAULT_CHANNELS),
                 "encrypted_channels": self.vault.encrypt_text(json.dumps(DEFAULT_CHANNELS)),
                 "voice": DEFAULT_VOICE,
                 "engine": DEFAULT_ENGINE,
@@ -54,15 +128,24 @@ class StorageService:
         return self._data["users"][uid]
 
     def _get_user_channels_unlocked(self, user: Dict[str, Any]) -> List[str]:
+        # 1. Primary source: unencrypted list (guarantees channels are NEVER lost due to encryption key rotation)
+        raw_channels = user.get("channels")
+        if isinstance(raw_channels, list) and len(raw_channels) > 0:
+            return [str(c).strip() for c in raw_channels if str(c).strip()]
+
+        # 2. Secondary source: decrypt encrypted_channels for backward compatibility
         enc = user.get("encrypted_channels")
         if enc:
             decrypted_json = self.vault.decrypt_text(enc)
             try:
                 res = json.loads(decrypted_json)
                 if isinstance(res, list) and len(res) > 0:
-                    return res
+                    cleaned = [str(c).strip() for c in res if str(c).strip()]
+                    user["channels"] = list(cleaned)
+                    return cleaned
             except Exception:
                 pass
+
         return list(DEFAULT_CHANNELS)
 
     async def get_user_channels(self, user_id: int) -> List[str]:
@@ -79,6 +162,7 @@ class StorageService:
             current_channels = self._get_user_channels_unlocked(user)
             if not any(c.lower() == clean_ch.lower() for c in current_channels):
                 current_channels.append(clean_ch)
+                user["channels"] = list(current_channels)
                 user["encrypted_channels"] = self.vault.encrypt_text(json.dumps(current_channels))
                 await self._save_unlocked()
                 return True
@@ -93,6 +177,7 @@ class StorageService:
             current_channels = self._get_user_channels_unlocked(user)
             new_channels = [c for c in current_channels if c.lower() != clean_ch.lower()]
             if len(new_channels) != len(current_channels):
+                user["channels"] = list(new_channels)
                 user["encrypted_channels"] = self.vault.encrypt_text(json.dumps(new_channels))
                 await self._save_unlocked()
                 return True
@@ -101,6 +186,7 @@ class StorageService:
     async def reset_user_channels(self, user_id: int) -> List[str]:
         async with self._lock:
             user = self._get_or_create_user(user_id)
+            user["channels"] = list(DEFAULT_CHANNELS)
             user["encrypted_channels"] = self.vault.encrypt_text(json.dumps(DEFAULT_CHANNELS))
             await self._save_unlocked()
             return list(DEFAULT_CHANNELS)
@@ -290,5 +376,14 @@ class StorageService:
 
     async def clear_user_seen_posts_today(self, user_id: int):
         await self.clear_user_seen_posts(user_id)
+
+    async def close(self):
+        """Cleanly closes PostgreSQL pool connection if open."""
+        if self._pg_pool:
+            try:
+                await self._pg_pool.close()
+                logger.info("PostgreSQL storage connection closed.")
+            except Exception as e:
+                logger.warning(f"Error closing PostgreSQL connection: {e}")
 
 storage_service = StorageService()

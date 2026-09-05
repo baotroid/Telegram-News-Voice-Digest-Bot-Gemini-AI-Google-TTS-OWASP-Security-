@@ -36,8 +36,12 @@ class DataSecurityVault:
     """
     def __init__(self, master_key: Optional[str] = None, salt: Optional[str] = None, key_file: str = "data/.secret.key"):
         raw_key = ""
-        if master_key and len(master_key) >= 16 and not master_key.startswith("GENERATE"):
-            raw_key = master_key
+        # 1. Check master key from arguments or environment variable
+        env_master = os.environ.get("ENCRYPTION_KEY") or os.environ.get("SECURITY_MASTER_KEY")
+        effective_key = master_key if (master_key and len(master_key) >= 16 and not master_key.startswith("GENERATE")) else env_master
+
+        if effective_key and len(effective_key) >= 16 and not effective_key.startswith("GENERATE"):
+            raw_key = effective_key
         else:
             try:
                 os.makedirs(os.path.dirname(key_file) if os.path.dirname(key_file) else "data", exist_ok=True)
@@ -45,12 +49,22 @@ class DataSecurityVault:
                     with open(key_file, "r", encoding="utf-8") as f:
                         raw_key = f.read().strip()
                 if not raw_key or len(raw_key) < 16:
-                    generated = Fernet.generate_key().decode("utf-8")
-                    raw_key = generated
-                    with open(key_file, "w", encoding="utf-8") as f:
-                        f.write(generated)
+                    # Deterministically derive key from BOT_TOKEN or fallback so it never changes on container restart
+                    bot_token_seed = os.environ.get("BOT_TOKEN") or "telegram-gemini-news-bot-fixed-seed-2026"
+                    import base64
+                    derived = hashlib.sha256(f"vault-key-seed:{bot_token_seed}".encode("utf-8")).digest()
+                    deterministic_key = base64.urlsafe_b64encode(derived).decode("utf-8")
+                    raw_key = deterministic_key
+                    try:
+                        with open(key_file, "w", encoding="utf-8") as f:
+                            f.write(deterministic_key)
+                    except Exception:
+                        pass
             except Exception:
-                raw_key = "telegram-gemini-news-bot-fixed-key-2026"
+                bot_token_seed = os.environ.get("BOT_TOKEN") or "telegram-gemini-news-bot-fixed-seed-2026"
+                import base64
+                derived = hashlib.sha256(f"vault-key-seed:{bot_token_seed}".encode("utf-8")).digest()
+                raw_key = base64.urlsafe_b64encode(derived).decode("utf-8")
 
         try:
             self._cipher = Fernet(raw_key.encode("utf-8"))
@@ -59,7 +73,7 @@ class DataSecurityVault:
             import base64
             self._cipher = Fernet(base64.urlsafe_b64encode(derived))
 
-        self.salt = (salt or "telegram-bot-default-salt-2026").encode("utf-8")
+        self.salt = (salt or os.environ.get("SECURITY_SALT") or "telegram-bot-default-salt-2026").encode("utf-8")
 
     def encrypt_text(self, plain_text: str) -> str:
         """Symmetrically encrypts a string before storing it in storage."""
